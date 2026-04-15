@@ -6863,18 +6863,18 @@ static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
 			for_each_netdev(net, dev) {
 				struct inet6_ifaddr *ifa;
 				LIST_HEAD(tmp_addr_list);
-				struct inet6_dev *i6dev;
+				struct inet6_dev *iter_idev;
 
-				i6dev = __in6_dev_get_rtnl_net(dev);
-				if (!i6dev || !i6dev->cnf.forwarding)
+				iter_idev = __in6_dev_get_rtnl_net(dev);
+				if (!iter_idev || !iter_idev->cnf.forwarding)
 					continue;
-				WRITE_ONCE(i6dev->cnf.subnet_router_anycast, new_val);
-				read_lock_bh(&i6dev->lock);
-				list_for_each_entry(ifa, &i6dev->addr_list, if_list) {
+				WRITE_ONCE(iter_idev->cnf.subnet_router_anycast, new_val);
+				read_lock_bh(&iter_idev->lock);
+				list_for_each_entry(ifa, &iter_idev->addr_list, if_list) {
 					if (!(ifa->flags & IFA_F_TENTATIVE))
 						list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
 				}
-				read_unlock_bh(&i6dev->lock);
+				read_unlock_bh(&iter_idev->lock);
 				while (!list_empty(&tmp_addr_list)) {
 					ifa = list_first_entry(&tmp_addr_list,
 							       struct inet6_ifaddr,
