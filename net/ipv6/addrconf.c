@@ -241,9 +241,8 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.subnet_router_anycast	= 1,
 };
-
-static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.forwarding		= 0,
 	.hop_limit		= IPV6_DEFAULT_HOPLIMIT,
 	.mtu6			= IPV6_MIN_MTU,
@@ -306,9 +305,8 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.subnet_router_anycast	= 1,
 };
-
-/* Check if link is ready: is it up and is a valid qdisc available */
 static inline bool addrconf_link_ready(const struct net_device *dev)
 {
 	return netif_oper_up(dev) && !qdisc_tx_is_noop(dev);
@@ -838,10 +836,12 @@ static void dev_forward_change(struct inet6_dev *idev)
 		ifa = list_first_entry(&tmp_addr_list,
 				       struct inet6_ifaddr, if_list_aux);
 		list_del(&ifa->if_list_aux);
-		if (idev->cnf.forwarding)
-			addrconf_join_anycast(ifa);
-		else
+		if (idev->cnf.forwarding) {
+			if (READ_ONCE(idev->cnf.subnet_router_anycast))
+				addrconf_join_anycast(ifa);
+		} else {
 			addrconf_leave_anycast(ifa);
+		}
 	}
 
 	inet6_netconf_notify_devconf(dev_net(dev), RTM_NEWNETCONF,
@@ -5728,6 +5728,7 @@ static void ipv6_store_devconf(const struct ipv6_devconf *cnf,
 		READ_ONCE(cnf->accept_untracked_na);
 	array[DEVCONF_ACCEPT_RA_MIN_LFT] = READ_ONCE(cnf->accept_ra_min_lft);
 	array[DEVCONF_FORCE_FORWARDING] = READ_ONCE(cnf->force_forwarding);
+	array[DEVCONF_SUBNET_ROUTER_ANYCAST] = READ_ONCE(cnf->subnet_router_anycast);
 }
 
 static inline size_t inet6_ifla6_size(void)
@@ -6298,7 +6299,8 @@ static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
 				&ifp->addr, ifp->idev->dev->name);
 		}
 
-		if (ifp->idev->cnf.forwarding)
+		if (ifp->idev->cnf.forwarding &&
+		    READ_ONCE(ifp->idev->cnf.subnet_router_anycast))
 			addrconf_join_anycast(ifp);
 		if (!ipv6_addr_any(&ifp->peer_addr))
 			addrconf_prefix_route(&ifp->peer_addr, 128,
@@ -6825,6 +6827,99 @@ static int addrconf_sysctl_force_forwarding(const struct ctl_table *ctl, int wri
 	return ret;
 }
 
+/*
+ * Walk the address list of @idev and join or leave the subnet-router anycast
+ * group for each non-tentative prefix address, according to @newf.  This is
+ * called when @subnet_router_anycast changes at run-time while forwarding is
+ * already enabled.
+ */
+static void addrconf_subnet_router_anycast_change(struct inet6_dev *idev,
+						  __s32 newf)
+{
+	struct inet6_ifaddr *ifa;
+	LIST_HEAD(tmp_addr_list);
+
+	if (!idev->cnf.forwarding)
+		return;
+
+	read_lock_bh(&idev->lock);
+	list_for_each_entry(ifa, &idev->addr_list, if_list) {
+		if (ifa->flags & IFA_F_TENTATIVE)
+			continue;
+		list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
+	}
+	read_unlock_bh(&idev->lock);
+
+	while (!list_empty(&tmp_addr_list)) {
+		ifa = list_first_entry(&tmp_addr_list,
+				       struct inet6_ifaddr, if_list_aux);
+		list_del(&ifa->if_list_aux);
+		if (newf)
+			addrconf_join_anycast(ifa);
+		else
+			addrconf_leave_anycast(ifa);
+	}
+}
+
+/* Propagate a subnet_router_anycast change to all interfaces in @net. */
+static void addrconf_subnet_router_anycast_change_all(struct net *net, __s32 newf)
+{
+	struct net_device *dev;
+	struct inet6_dev *idev;
+
+	for_each_netdev(net, dev) {
+		idev = __in6_dev_get_rtnl_net(dev);
+		if (idev) {
+			int changed = (!idev->cnf.subnet_router_anycast) ^ (!newf);
+
+			WRITE_ONCE(idev->cnf.subnet_router_anycast, newf);
+			if (changed)
+				addrconf_subnet_router_anycast_change(idev, newf);
+		}
+	}
+}
+
+static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
+						 int write, void *buffer,
+						 size_t *lenp, loff_t *ppos)
+{
+	struct inet6_dev *idev = ctl->extra1;
+	struct ctl_table tmp_ctl = *ctl;
+	struct net *net = ctl->extra2;
+	int *valp = ctl->data;
+	int new_val = *valp;
+	int old_val = *valp;
+	loff_t pos = *ppos;
+	int ret;
+
+	tmp_ctl.extra1 = SYSCTL_ZERO;
+	tmp_ctl.extra2 = SYSCTL_ONE;
+	tmp_ctl.data = &new_val;
+
+	ret = proc_dointvec_minmax(&tmp_ctl, write, buffer, lenp, ppos);
+
+	if (write && old_val != new_val) {
+		if (!rtnl_net_trylock(net))
+			return restart_syscall();
+
+		WRITE_ONCE(*valp, new_val);
+
+		if (valp == &net->ipv6.devconf_dflt->subnet_router_anycast) {
+			/* only affects new interfaces; nothing to reconcile */
+		} else if (valp == &net->ipv6.devconf_all->subnet_router_anycast) {
+			addrconf_subnet_router_anycast_change_all(net, new_val);
+		} else if (idev) {
+			addrconf_subnet_router_anycast_change(idev, new_val);
+		}
+
+		rtnl_net_unlock(net);
+	}
+
+	if (ret)
+		*ppos = pos;
+	return ret;
+}
+
 static int minus_one = -1;
 static const int two_five_five = 255;
 static u32 ioam6_if_id_max = U16_MAX;
@@ -7303,6 +7398,13 @@ static const struct ctl_table addrconf_sysctl[] = {
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= addrconf_sysctl_force_forwarding,
+	},
+	{
+		.procname	= "subnet_router_anycast",
+		.data		= &ipv6_devconf.subnet_router_anycast,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= addrconf_sysctl_subnet_router_anycast,
 	},
 };
 

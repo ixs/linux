@@ -2672,6 +2672,35 @@ force_forwarding - BOOLEAN
 	``conf/all/forwarding``. When setting ``conf.all.forwarding`` to 0,
 	the ``force_forwarding`` flag will be reset on all interfaces.
 
+subnet_router_anycast - BOOLEAN
+	Control whether the kernel automatically joins and leaves the
+	Subnet-Router Anycast address (the all-zeros host part of each
+	assigned prefix, per RFC 4291 section 2.6.1) when IPv6 forwarding
+	is enabled on the interface.
+
+	When enabled (default), the kernel joins the Subnet-Router Anycast
+	group for every non-tentative address on the interface as soon as
+	forwarding is turned on, and leaves those groups when forwarding is
+	turned off or the address is removed.  This is the correct behaviour
+	for a traditional router with access to other networks.
+
+	Disable this on systems that need ``forwarding`` enabled for other
+	reasons (e.g. container hosts, VPN gateways, or hosts running
+	Docker/Podman) but that should not act as Subnet-Router Anycast
+	targets.
+
+	When ``conf/all/subnet_router_anycast`` is changed, the new value is
+	propagated to all interfaces and their anycast group memberships are
+	reconciled immediately.  Changing ``conf/default/subnet_router_anycast``
+	only affects newly created interfaces.
+
+	Possible values:
+
+	- 0 - Do not automatically join/leave Subnet-Router Anycast groups.
+	- 1 - Automatically join/leave Subnet-Router Anycast groups (default).
+
+	Default: 1 (enabled)
+
 fwmark_reflect - BOOLEAN
 	Controls the fwmark of kernel-generated IPv6 reply packets that are not
 	associated with a socket for example, TCP RSTs or ICMPv6 echo replies).
