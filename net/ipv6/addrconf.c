@@ -243,6 +243,8 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.force_forwarding	= 0,
 	.subnet_router_anycast	= 1,
 };
+
+static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.forwarding		= 0,
 	.hop_limit		= IPV6_DEFAULT_HOPLIMIT,
 	.mtu6			= IPV6_MIN_MTU,
@@ -307,6 +309,8 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.force_forwarding	= 0,
 	.subnet_router_anycast	= 1,
 };
+
+/* Check if link is ready: is it up and is a valid qdisc available */
 static inline bool addrconf_link_ready(const struct net_device *dev)
 {
 	return netif_oper_up(dev) && !qdisc_tx_is_noop(dev);
@@ -837,8 +841,7 @@ static void dev_forward_change(struct inet6_dev *idev)
 				       struct inet6_ifaddr, if_list_aux);
 		list_del(&ifa->if_list_aux);
 		if (idev->cnf.forwarding) {
-			if (READ_ONCE(idev->cnf.subnet_router_anycast))
-				addrconf_join_anycast(ifa);
+			addrconf_join_anycast(ifa);
 		} else {
 			addrconf_leave_anycast(ifa);
 		}
@@ -2261,6 +2264,8 @@ static void addrconf_join_anycast(struct inet6_ifaddr *ifp)
 {
 	struct in6_addr addr;
 
+	if (!READ_ONCE(ifp->idev->cnf.subnet_router_anycast))
+		return;
 	if (ifp->prefix_len >= 127) /* RFC 6164 */
 		return;
 	ipv6_addr_prefix(&addr, &ifp->addr, ifp->prefix_len);
@@ -6299,8 +6304,7 @@ static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
 				&ifp->addr, ifp->idev->dev->name);
 		}
 
-		if (ifp->idev->cnf.forwarding &&
-		    READ_ONCE(ifp->idev->cnf.subnet_router_anycast))
+		if (ifp->idev->cnf.forwarding)
 			addrconf_join_anycast(ifp);
 		if (!ipv6_addr_any(&ifp->peer_addr))
 			addrconf_prefix_route(&ifp->peer_addr, 128,
@@ -6827,58 +6831,6 @@ static int addrconf_sysctl_force_forwarding(const struct ctl_table *ctl, int wri
 	return ret;
 }
 
-/*
- * Walk the address list of @idev and join or leave the subnet-router anycast
- * group for each non-tentative prefix address, according to @newf.  This is
- * called when @subnet_router_anycast changes at run-time while forwarding is
- * already enabled.
- */
-static void addrconf_subnet_router_anycast_change(struct inet6_dev *idev,
-						  __s32 newf)
-{
-	struct inet6_ifaddr *ifa;
-	LIST_HEAD(tmp_addr_list);
-
-	if (!idev->cnf.forwarding)
-		return;
-
-	read_lock_bh(&idev->lock);
-	list_for_each_entry(ifa, &idev->addr_list, if_list) {
-		if (ifa->flags & IFA_F_TENTATIVE)
-			continue;
-		list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
-	}
-	read_unlock_bh(&idev->lock);
-
-	while (!list_empty(&tmp_addr_list)) {
-		ifa = list_first_entry(&tmp_addr_list,
-				       struct inet6_ifaddr, if_list_aux);
-		list_del(&ifa->if_list_aux);
-		if (newf)
-			addrconf_join_anycast(ifa);
-		else
-			addrconf_leave_anycast(ifa);
-	}
-}
-
-/* Propagate a subnet_router_anycast change to all interfaces in @net. */
-static void addrconf_subnet_router_anycast_change_all(struct net *net, __s32 newf)
-{
-	struct net_device *dev;
-	struct inet6_dev *idev;
-
-	for_each_netdev(net, dev) {
-		idev = __in6_dev_get_rtnl_net(dev);
-		if (idev) {
-			int changed = (!idev->cnf.subnet_router_anycast) ^ (!newf);
-
-			WRITE_ONCE(idev->cnf.subnet_router_anycast, newf);
-			if (changed)
-				addrconf_subnet_router_anycast_change(idev, newf);
-		}
-	}
-}
-
 static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
 						 int write, void *buffer,
 						 size_t *lenp, loff_t *ppos)
@@ -6886,9 +6838,9 @@ static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
 	struct inet6_dev *idev = ctl->extra1;
 	struct ctl_table tmp_ctl = *ctl;
 	struct net *net = ctl->extra2;
-	int *valp = ctl->data;
-	int new_val = *valp;
-	int old_val = *valp;
+	u8 *valp = ctl->data;
+	u8 new_val = *valp;
+	u8 old_val = *valp;
 	loff_t pos = *ppos;
 	int ret;
 
@@ -6896,7 +6848,7 @@ static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
 	tmp_ctl.extra2 = SYSCTL_ONE;
 	tmp_ctl.data = &new_val;
 
-	ret = proc_dointvec_minmax(&tmp_ctl, write, buffer, lenp, ppos);
+	ret = proc_dou8vec_minmax(&tmp_ctl, write, buffer, lenp, ppos);
 
 	if (write && old_val != new_val) {
 		if (!rtnl_net_trylock(net))
@@ -6904,13 +6856,60 @@ static int addrconf_sysctl_subnet_router_anycast(const struct ctl_table *ctl,
 
 		WRITE_ONCE(*valp, new_val);
 
-		if (valp == &net->ipv6.devconf_dflt->subnet_router_anycast) {
-			/* only affects new interfaces; nothing to reconcile */
-		} else if (valp == &net->ipv6.devconf_all->subnet_router_anycast) {
-			addrconf_subnet_router_anycast_change_all(net, new_val);
-		} else if (idev) {
-			addrconf_subnet_router_anycast_change(idev, new_val);
+		if (valp == &net->ipv6.devconf_all->subnet_router_anycast) {
+			/* Propagate to all interfaces in this netns */
+			struct net_device *dev;
+
+			for_each_netdev(net, dev) {
+				struct inet6_ifaddr *ifa;
+				LIST_HEAD(tmp_addr_list);
+				struct inet6_dev *i6dev;
+
+				i6dev = __in6_dev_get_rtnl_net(dev);
+				if (!i6dev || !i6dev->cnf.forwarding)
+					continue;
+				WRITE_ONCE(i6dev->cnf.subnet_router_anycast, new_val);
+				read_lock_bh(&i6dev->lock);
+				list_for_each_entry(ifa, &i6dev->addr_list, if_list) {
+					if (!(ifa->flags & IFA_F_TENTATIVE))
+						list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
+				}
+				read_unlock_bh(&i6dev->lock);
+				while (!list_empty(&tmp_addr_list)) {
+					ifa = list_first_entry(&tmp_addr_list,
+							       struct inet6_ifaddr,
+							       if_list_aux);
+					list_del(&ifa->if_list_aux);
+					if (new_val)
+						addrconf_join_anycast(ifa);
+					else
+						addrconf_leave_anycast(ifa);
+				}
+			}
+		} else if (valp != &net->ipv6.devconf_dflt->subnet_router_anycast &&
+			   idev && idev->cnf.forwarding) {
+			/* Per-interface change: reconcile this device */
+			struct inet6_ifaddr *ifa;
+			LIST_HEAD(tmp_addr_list);
+
+			read_lock_bh(&idev->lock);
+			list_for_each_entry(ifa, &idev->addr_list, if_list) {
+				if (!(ifa->flags & IFA_F_TENTATIVE))
+					list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
+			}
+			read_unlock_bh(&idev->lock);
+			while (!list_empty(&tmp_addr_list)) {
+				ifa = list_first_entry(&tmp_addr_list,
+						       struct inet6_ifaddr,
+						       if_list_aux);
+				list_del(&ifa->if_list_aux);
+				if (new_val)
+					addrconf_join_anycast(ifa);
+				else
+					addrconf_leave_anycast(ifa);
+			}
 		}
+		/* devconf_dflt change only affects new interfaces; nothing to reconcile */
 
 		rtnl_net_unlock(net);
 	}
@@ -7402,9 +7401,11 @@ static const struct ctl_table addrconf_sysctl[] = {
 	{
 		.procname	= "subnet_router_anycast",
 		.data		= &ipv6_devconf.subnet_router_anycast,
-		.maxlen		= sizeof(int),
+		.maxlen		= sizeof(u8),
 		.mode		= 0644,
 		.proc_handler	= addrconf_sysctl_subnet_router_anycast,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
 	},
 };
 
