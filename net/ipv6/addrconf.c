@@ -840,11 +840,10 @@ static void dev_forward_change(struct inet6_dev *idev)
 		ifa = list_first_entry(&tmp_addr_list,
 				       struct inet6_ifaddr, if_list_aux);
 		list_del(&ifa->if_list_aux);
-		if (idev->cnf.forwarding) {
+		if (idev->cnf.forwarding)
 			addrconf_join_anycast(ifa);
-		} else {
+		else
 			addrconf_leave_anycast(ifa);
-		}
 	}
 
 	inet6_netconf_notify_devconf(dev_net(dev), RTM_NEWNETCONF,
